@@ -1,1 +1,11 @@
-
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="HostX logo">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8B5CF6"/>
+      <stop offset="1" stop-color="#4F46E5"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="#0F1020"/>
+  <path d="M24 32h18v24h44V32h18v64H86V72H42v24H24z" fill="url(#g)"/>
+  <path d="M58 44h12v40H58z" fill="#fff" opacity=".92"/>
+</svg>
