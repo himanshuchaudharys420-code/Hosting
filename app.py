@@ -8,6 +8,10 @@ import shutil
 import zipfile
 import subprocess
 import signal
+import stat
+import smtplib
+import ssl
+from email.message import EmailMessage
 try:
     import psutil
 except ImportError:
@@ -40,9 +44,11 @@ except ImportError:
 
     psutil = DummyPsutil()
 import ast
+import importlib.machinery
 import re
 import threading
 import urllib.request
+from urllib.parse import urlsplit
 from datetime import datetime, timedelta, date
 from functools import wraps
 import hashlib
@@ -117,13 +123,8 @@ def safe_check_password_hash(pwhash: str, password: str) -> bool:
         except Exception:
             pass
 
-    # 4. Direct plain text fallback (for test/legacy support)
-    try:
-        if hmac.compare_digest(pwhash, password):
-            return True
-    except Exception:
-        pass
-
+    # Never accept plaintext passwords. Legacy plaintext accounts must use an
+    # administrator-assisted password reset rather than silently authenticating.
     return False
 
 from flask import (
@@ -133,11 +134,20 @@ from flask import (
 
 # Initialize Flask application
 app = Flask(__name__, template_folder='templates', static_folder='static')
-app.secret_key = os.environ.get('SECRET_KEY', 'hostx_vip_white_super_secret_key_2026_secure')
+_secret_key = os.environ.get('SECRET_KEY', '').strip()
+if not _secret_key:
+    if os.environ.get('RENDER') or os.environ.get('FLASK_ENV') == 'production':
+        raise RuntimeError('SECRET_KEY must be set in production. Generate a long random value and add it to your hosting secrets.')
+    _secret_key = secrets.token_hex(32)
+    print('[SECURITY] SECRET_KEY was not set; a temporary development key was generated. Set SECRET_KEY before deployment.', flush=True)
+
+app.secret_key = _secret_key
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50 MB max upload
+app.config['MAX_FORM_MEMORY_SIZE'] = 2 * 1024 * 1024
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
-app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=3650)
+app.config['SESSION_COOKIE_SECURE'] = os.environ.get('COOKIE_SECURE', '1' if os.environ.get('RENDER') else '0') == '1'
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=14)
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 
@@ -487,27 +497,69 @@ def init_db():
             'update'
         ))
 
-    # Seed default Super Admin account if no admin exists
-    cursor.execute("SELECT COUNT(*) FROM users WHERE role IN ('admin', 'super_admin') OR is_admin = 1")
-    if cursor.fetchone()[0] == 0:
-        admin_email = os.environ.get('ADMIN_EMAIL', 'adminrifat')
-        admin_pass = os.environ.get('ADMIN_PASSWORD', '123456789')
-        admin_hash = safe_generate_password_hash(admin_pass)
-        cursor.execute('''
-            INSERT INTO users (full_name, username, email, password_hash, coins, role, is_admin, is_super_admin, admin_permissions, status)
-            VALUES (?, ?, ?, ?, ?, 'super_admin', 1, 1, 'manage_users,manage_coins,manage_files,manage_settings,manage_announcements,manage_broadcasts,view_logs', 'active')
-        ''', ('HostX Super Administrator', 'admin', admin_email, admin_hash, 1000))
-        print(f"[*] Default Super Admin user initialized: {admin_email}")
+    # Secure administrator bootstrap: never ship a public default password or
+    # promote accounts based on a predictable username/email.
+    admin_email = os.environ.get('ADMIN_EMAIL', '').strip().lower()
+    admin_pass = os.environ.get('ADMIN_PASSWORD', '')
+    admin_permissions = 'manage_users,manage_coins,manage_files,manage_settings,manage_announcements,manage_broadcasts,view_logs'
 
-    # Flag primary Super Admin accounts and sync role / is_admin / is_super_admin
-    primary_super_admins = ['admin@hostx.io', 'admin@hostx.vip', 'yeasingahmmed0011@gmail.com', 'admin']
-    for p_email in primary_super_admins:
-        cursor.execute("""
-            UPDATE users 
-            SET role = 'super_admin', is_admin = 1, is_super_admin = 1,
-                admin_permissions = 'manage_users,manage_coins,manage_files,manage_settings,manage_announcements,manage_broadcasts,view_logs'
-            WHERE LOWER(email) = LOWER(?) OR LOWER(username) = LOWER(?)
-        """, (p_email, p_email))
+    if admin_email and admin_pass:
+        if '@' not in admin_email or any(ch.isspace() for ch in admin_email):
+            raise RuntimeError('ADMIN_EMAIL must be a valid email address.')
+        if len(admin_pass) < 12:
+            raise RuntimeError('ADMIN_PASSWORD must be at least 12 characters long.')
+        admin_hash = safe_generate_password_hash(admin_pass)
+        existing_admin = cursor.execute(
+            "SELECT id FROM users WHERE LOWER(email) = LOWER(?)", (admin_email,)
+        ).fetchone()
+        if existing_admin:
+            cursor.execute(
+                "UPDATE users SET password_hash = ?, role = 'super_admin', is_admin = 1, "
+                "is_super_admin = 1, admin_permissions = ?, status = 'active' WHERE id = ?",
+                (admin_hash, admin_permissions, existing_admin[0])
+            )
+        else:
+            base_username = 'hostx_admin'
+            username = base_username
+            suffix = 1
+            while cursor.execute("SELECT 1 FROM users WHERE LOWER(username) = LOWER(?)", (username,)).fetchone():
+                suffix += 1
+                username = f'{base_username}{suffix}'
+            cursor.execute('''
+                INSERT INTO users (full_name, username, email, password_hash, coins, role, is_admin, is_super_admin, admin_permissions, status)
+                VALUES (?, ?, ?, ?, ?, 'super_admin', 1, 1, ?, 'active')
+            ''', ('HostX Super Administrator', username, admin_email, admin_hash, 1000, admin_permissions))
+        print(f"[*] Super administrator configured from ADMIN_EMAIL: {admin_email}", flush=True)
+    else:
+        # Disable the insecure legacy account created by older builds only when
+        # it still has the shipped password. A user who changed it is untouched.
+        legacy_admin = cursor.execute(
+            "SELECT id, password_hash FROM users WHERE LOWER(username) = 'admin' AND LOWER(email) = 'adminrifat'"
+        ).fetchone()
+        if legacy_admin and safe_check_password_hash(legacy_admin[1], '123456789'):
+            cursor.execute(
+                "UPDATE users SET role = 'user', is_admin = 0, is_super_admin = 0, "
+                "admin_permissions = '', status = 'disabled' WHERE id = ?",
+                (legacy_admin[0],)
+            )
+            print('[SECURITY] Disabled the old default admin account. Configure ADMIN_EMAIL and ADMIN_PASSWORD.', flush=True)
+
+        admin_count = cursor.execute(
+            "SELECT COUNT(*) FROM users WHERE role IN ('admin', 'super_admin') OR is_admin = 1"
+        ).fetchone()[0]
+        if admin_count == 0:
+            print('[SECURITY WARNING] No administrator exists. Set ADMIN_EMAIL and ADMIN_PASSWORD (12+ characters) in environment secrets.', flush=True)
+
+    # Remove privilege that older builds assigned solely from hard-coded aliases.
+    # Keep the explicitly configured ADMIN_EMAIL account elevated.
+    legacy_admin_aliases = ['admin@hostx.io', 'admin@hostx.vip', 'yeasingahmmed0011@gmail.com', 'admin']
+    for alias in legacy_admin_aliases:
+        cursor.execute(
+            "UPDATE users SET role = 'user', is_admin = 0, is_super_admin = 0, admin_permissions = '' "
+            "WHERE (LOWER(email) = LOWER(?) OR LOWER(username) = LOWER(?)) "
+            "AND LOWER(email) != LOWER(?)",
+            (alias, alias, admin_email)
+        )
 
     cursor.execute("UPDATE users SET is_admin = 1 WHERE role IN ('admin', 'super_admin')")
     cursor.execute("UPDATE users SET is_super_admin = 1 WHERE role = 'super_admin'")
@@ -630,17 +682,8 @@ def is_user_super_admin(user):
         return False
     role = user['role'] if ('role' in user.keys() and user['role']) else None
     is_super = user['is_super_admin'] if ('is_super_admin' in user.keys() and user['is_super_admin'] is not None) else 0
-    email = (user['email'] if ('email' in user.keys() and user['email']) else '').lower().strip()
-    username = (user['username'] if ('username' in user.keys() and user['username']) else '').lower().strip()
-    
-    if role == 'super_admin' or str(is_super) in ('1', 'true', 'True'):
-        return True
-        
-    primary_super_admins = ['gmail', 'gmail', 'gmail', 'admin']
-    if email in primary_super_admins or username in primary_super_admins:
-        return True
-        
-    return False
+    return role == 'super_admin' or str(is_super) in ('1', 'true', 'True')
+
 
 def is_user_admin(user):
     if not user:
@@ -660,7 +703,7 @@ def has_admin_permission(user, permission_name):
         return True
     perms_str = user['admin_permissions'] if ('admin_permissions' in user.keys() and user['admin_permissions']) else ''
     if not perms_str:
-        return True
+        return False
     perms_list = [p.strip() for p in perms_str.split(',') if p.strip()]
     return permission_name in perms_list or 'all' in perms_list
 
@@ -788,18 +831,18 @@ def admin_permission_required(permission_name):
 
 @app.before_request
 def check_maintenance_and_auth():
-    # Dynamic URL Auto-Detection
-    try:
-        url_root = request.url_root.rstrip('/')
-        if url_root and "127.0.0.1" not in url_root and "localhost" not in url_root:
-            current_detected = get_setting('detected_site_url', '')
-            if current_detected != url_root:
-                set_setting('detected_site_url', url_root)
-    except Exception:
-        pass
+    # Use the explicitly configured public URL. Do not trust the incoming
+    # Host header for background self-ping targets.
+    configured_app_url = os.environ.get('APP_URL', '').strip().rstrip('/')
+    if configured_app_url:
+        try:
+            if get_setting('detected_site_url', '') != configured_app_url:
+                set_setting('detected_site_url', configured_app_url)
+        except Exception:
+            pass
 
     # Allow health check, static files, signin, admin login, and errors always
-    allowed_endpoints = ['health', 'static', 'signin', 'signout', 'admin_dashboard', 'stop_impersonating']
+    allowed_endpoints = ['health', 'health_check', 'static', 'signin', 'signout', 'admin_dashboard', 'stop_impersonating']
     if request.endpoint in allowed_endpoints:
         return
     
@@ -814,7 +857,6 @@ def check_maintenance_and_auth():
                 return jsonify({'error': 'Platform is under maintenance', 'maintenance': True}), 503
             return render_template('home.html', maintenance_active=True)
 
-@app.route('/health')
 @app.route('/api/health')
 def health_check():
     return jsonify({'status': 'ok', 'app': 'HostX VIP White', 'time': datetime.utcnow().isoformat()})
@@ -825,6 +867,28 @@ def get_server_dir(user_id, server_id):
     os.makedirs(path, exist_ok=True)
     return path
 
+def get_server_runtime_env(server_dir, packages_dir=None):
+    """Build a minimal child environment; never copy panel secrets to user code."""
+    temp_dir = os.path.join(server_dir, 'tmp')
+    os.makedirs(temp_dir, exist_ok=True)
+    env = {
+        'PATH': os.environ.get('PATH', ''),
+        'HOME': server_dir,
+        'TMPDIR': temp_dir,
+        'TEMP': temp_dir,
+        'TMP': temp_dir,
+        'PYTHONUNBUFFERED': '1',
+        'PYTHONDONTWRITEBYTECODE': '1',
+    }
+    for key in ('LANG', 'LC_ALL', 'TZ', 'SSL_CERT_FILE', 'SSL_CERT_DIR'):
+        if os.environ.get(key):
+            env[key] = os.environ[key]
+    python_paths = [server_dir]
+    if packages_dir:
+        python_paths.append(packages_dir)
+    env['PYTHONPATH'] = os.pathsep.join(python_paths)
+    return env
+
 def check_server_ownership(server_id, user_id=None):
     if user_id is None:
         user_id = session.get('user_id')
@@ -833,7 +897,7 @@ def check_server_ownership(server_id, user_id=None):
     if not server:
         return None
     curr_user = get_current_user()
-    if curr_user and curr_user['role'] == 'admin':
+    if curr_user and is_user_admin(curr_user):
         return server
     if server['user_id'] != user_id:
         return None
@@ -1023,32 +1087,33 @@ def fetch_pypi_package_info(package_name):
         }
 
 def is_package_or_import_installed(server_dir, import_or_pkg_name):
-    """Test whether a module or package can be successfully imported in the server sandbox"""
+    """Check package presence without importing or executing uploaded modules."""
     packages_dir = os.path.join(server_dir, 'packages')
-    # Check direct directory existence first for speed
-    if os.path.exists(packages_dir):
-        pkg_lower = import_or_pkg_name.lower().replace('-', '_')
+    clean_name = str(import_or_pkg_name or '').strip()
+    if not clean_name:
+        return False
+
+    pkg_lower = clean_name.lower().replace('-', '_').replace('.', '_')
+    if os.path.isdir(packages_dir):
         for item in os.listdir(packages_dir):
-            item_lower = item.lower().replace('-', '_')
-            if item_lower == pkg_lower or item_lower.startswith(f"{pkg_lower}-") or item_lower.startswith(f"{pkg_lower}."):
+            item_lower = item.lower().replace('-', '_').replace('.', '_')
+            if item_lower == pkg_lower or item_lower.startswith(f"{pkg_lower}-") or item_lower.startswith(f"{pkg_lower}_") or item_lower.startswith(f"{pkg_lower}."):
                 return True
 
-    # Test via Python subshell import check with server's PYTHONPATH
-    test_code = f"import {import_or_pkg_name}"
-    env = os.environ.copy()
-    env['PYTHONPATH'] = f"{server_dir}:{packages_dir}:" + env.get('PYTHONPATH', '')
-    try:
-        res = subprocess.run(
-            [sys.executable, '-c', test_code],
-            cwd=server_dir,
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=2.5
-        )
-        return res.returncode == 0
-    except Exception:
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', clean_name):
         return False
+
+    server_real = os.path.realpath(server_dir)
+    search_paths = [packages_dir]
+    for entry in sys.path:
+        resolved = os.path.realpath(entry or os.getcwd())
+        if resolved != server_real:
+            search_paths.append(entry or os.getcwd())
+    try:
+        return importlib.machinery.PathFinder.find_spec(clean_name, search_paths) is not None
+    except (ImportError, ModuleNotFoundError, ValueError, OSError):
+        return False
+
 
 def scan_and_analyze_project(server_dir, server_id=None):
     """
@@ -1104,14 +1169,19 @@ def scan_and_analyze_project(server_dir, server_id=None):
         try:
             with open(req_path, 'r', encoding='utf-8', errors='ignore') as rf:
                 for line in rf:
-                    line = line.strip()
-                    if line and not line.startswith('#'):
-                        # Parse package name and version
-                        m = re.split(r'==|>=|<=|~=|!=|>', line, maxsplit=1)
-                        pkg_name = m[0].strip()
-                        ver = m[1].strip() if len(m) > 1 else 'latest'
-                        if pkg_name:
-                            req_packages[pkg_name] = ver
+                    line = line.split('#', 1)[0].strip()
+                    if not line or line.startswith(('-', 'git+', 'http://', 'https://')):
+                        continue
+                    line = line.split(';', 1)[0].strip()
+                    line = re.sub(r'\[[^\]]*\]', '', line)
+                    match = re.match(
+                        r'^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\s*(?:===|==|~=|!=|>=|<=|>|<)\s*([^\s,]+))?',
+                        line
+                    )
+                    if match:
+                        pkg_name = match.group(1).strip()
+                        ver = match.group(2).strip() if match.group(2) else 'latest'
+                        req_packages[pkg_name] = ver
         except Exception:
             pass
 
@@ -1142,7 +1212,7 @@ def scan_and_analyze_project(server_dir, server_id=None):
     # Add requirements.txt packages first (preserves pinned versions)
     for pkg_name, ver in req_packages.items():
         # Find corresponding import name if known
-        import_name = pkg_name
+        import_name = re.sub(r'[-.]', '_', pkg_name)
         for imp, info in IMPORT_TO_PACKAGE_MAP.items():
             if info['pkg'].lower() == pkg_name.lower():
                 import_name = imp
@@ -1401,7 +1471,8 @@ def start_server_process(server_id):
                 cwd=server_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True
+                text=True,
+                env=get_server_runtime_env(server_dir, local_pkg_dir)
             )
             if proc_pip.stdout:
                 for line in proc_pip.stdout:
@@ -1444,7 +1515,8 @@ def start_server_process(server_id):
                     cwd=server_dir,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    text=True
+                    text=True,
+                    env=get_server_runtime_env(server_dir, local_pkg_dir)
                 )
                 if proc_auto.stdout:
                     for line in proc_auto.stdout:
@@ -1489,12 +1561,7 @@ def start_server_process(server_id):
     log_file.flush()
     
     try:
-        env = os.environ.copy()
-        env['PYTHONUNBUFFERED'] = '1'
-        if os.path.exists(local_pkg_dir):
-            env['PYTHONPATH'] = f"{server_dir}:{local_pkg_dir}:" + env.get('PYTHONPATH', '')
-        else:
-            env['PYTHONPATH'] = f"{server_dir}:" + env.get('PYTHONPATH', '')
+        env = get_server_runtime_env(server_dir, local_pkg_dir)
             
         proc = subprocess.Popen(
             [sys.executable, entry_file],
@@ -1566,6 +1633,12 @@ def health():
         'timestamp': datetime.utcnow().isoformat()
     }), 200
 
+def get_request_data():
+    """Return JSON or form payload without Flask 3.x 415/None surprises."""
+    if request.is_json:
+        return request.get_json(silent=True) or {}
+    return request.form
+
 # 1. HOME / LANDING PAGE
 @app.route('/')
 def home():
@@ -1606,7 +1679,7 @@ def signin():
             flash('Invalid email or password.', 'danger')
             return render_template('signin.html', email=email)
             
-        if user['status'] == 'disabled':
+        if user['status'] != 'active':
             flash('This account has been suspended. Please contact support.', 'danger')
             return render_template('signin.html', email=email)
             
@@ -1628,96 +1701,205 @@ def signin():
         session['user_id'] = user['id']
         session['username'] = user['username']
         session['role'] = user['role']
-        session.permanent = True  # Always keep the user logged in persistently until manual signout
+        session.permanent = remember
             
         flash(f'Welcome back, {user["full_name"]}!', 'success')
-        next_url = request.args.get('next')
-        if next_url and next_url.startswith('/'):
-            return redirect(next_url)
+        next_url = request.args.get('next', '')
+        if next_url:
+            parsed_next = urlsplit(next_url)
+            if next_url.startswith('/') and not next_url.startswith('//') and not parsed_next.scheme and not parsed_next.netloc:
+                return redirect(next_url)
         return redirect(url_for('dashboard'))
         
     return render_template('signin.html')
 
-# 2.5 FORGOT PASSWORD API (Step-by-step)
+# 2.5 FORGOT PASSWORD API — email OTP verification
+def send_password_reset_otp(recipient, otp):
+    smtp_host = os.environ.get('SMTP_HOST', '').strip()
+    smtp_user = os.environ.get('SMTP_USER', '').strip()
+    smtp_password = os.environ.get('SMTP_PASSWORD', '')
+    smtp_from = os.environ.get('SMTP_FROM', '').strip() or smtp_user
+    smtp_port = int(os.environ.get('SMTP_PORT', '587'))
+
+    if not all((smtp_host, smtp_user, smtp_password, smtp_from)):
+        raise RuntimeError('Password reset email is not configured. Contact the administrator.')
+
+    message = EmailMessage()
+    message['Subject'] = 'HostX VIP password reset code'
+    message['From'] = smtp_from
+    message['To'] = recipient
+    message.set_content(
+        f"Your HostX VIP password reset code is: {otp}\n\n"
+        "This code expires in 10 minutes. If you did not request this, ignore this email.\n"
+    )
+
+    if smtp_port == 465:
+        with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=15, context=ssl.create_default_context()) as server:
+            server.login(smtp_user, smtp_password)
+            server.send_message(message)
+    else:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
+            server.ehlo()
+            if os.environ.get('SMTP_USE_TLS', '1') == '1':
+                server.starttls(context=ssl.create_default_context())
+                server.ehlo()
+            server.login(smtp_user, smtp_password)
+            server.send_message(message)
+
+
 @app.route('/api/forgot-password/captcha', methods=['GET'])
 def forgot_password_captcha():
-    import random
-    num1 = random.randint(1, 10)
-    num2 = random.randint(1, 10)
-    op = random.choice(['+', '-', '*'])
+    num1 = secrets.randbelow(10) + 1
+    num2 = secrets.randbelow(10) + 1
+    op = secrets.choice(['+', '-', '*'])
     if op == '+':
-        ans = num1 + num2
+        answer = num1 + num2
     elif op == '-':
-        ans = num1 - num2
+        answer = num1 - num2
     else:
-        ans = num1 * num2
-    session['forgot_captcha_ans'] = ans
+        answer = num1 * num2
+    session['forgot_captcha_ans'] = answer
+    session['forgot_captcha_expires'] = time.time() + 300
+    session['forgot_captcha_attempts'] = 0
     session['forgot_captcha_verified'] = False
-    session['forgot_verified_email'] = None
-    return jsonify({
-        'question': f"{num1} {op} {num2} = ?"
-    })
+    session.pop('forgot_verified_email', None)
+    session.pop('forgot_otp_hash', None)
+    session.pop('forgot_otp_verified', None)
+    return jsonify({'question': f"{num1} {op} {num2} = ?"})
+
 
 @app.route('/api/forgot-password/verify-captcha', methods=['POST'])
 def forgot_password_verify_captcha():
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     try:
-        user_ans = int(data.get('answer', ''))
+        user_answer = int(data.get('answer', ''))
     except (ValueError, TypeError):
-        return jsonify({'success': False, 'message': 'Please enter a valid number.'})
-    
+        return jsonify({'success': False, 'message': 'Please enter a valid number.'}), 400
+
     expected = session.get('forgot_captcha_ans')
-    if expected is not None and user_ans == expected:
+    if expected is None or time.time() > session.get('forgot_captcha_expires', 0):
+        return jsonify({'success': False, 'message': 'Challenge expired. Please reload it.'}), 400
+
+    attempts = int(session.get('forgot_captcha_attempts', 0))
+    if attempts >= 5:
+        return jsonify({'success': False, 'message': 'Too many attempts. Reload the challenge.'}), 429
+
+    if user_answer == expected:
         session['forgot_captcha_verified'] = True
         return jsonify({'success': True})
-    return jsonify({'success': False, 'message': 'Incorrect answer. Please try again.'})
+
+    session['forgot_captcha_attempts'] = attempts + 1
+    return jsonify({'success': False, 'message': 'Incorrect answer. Please try again.'}), 400
+
 
 @app.route('/api/forgot-password/verify-email', methods=['POST'])
 def forgot_password_verify_email():
     if not session.get('forgot_captcha_verified'):
-        return jsonify({'success': False, 'message': 'Security Captcha challenge not completed yet.'})
-    
-    data = request.get_json() or {}
-    email = data.get('email', '').strip().lower()
-    if not email:
-        return jsonify({'success': False, 'message': 'Please enter your registered email address.'})
-    
+        return jsonify({'success': False, 'message': 'Complete the security challenge first.'}), 403
+
+    data = request.get_json(silent=True) or {}
+    email = str(data.get('email', '')).strip().lower()
+    if not email or len(email) > 254 or '@' not in email:
+        return jsonify({'success': False, 'message': 'Please enter a valid email address.'}), 400
+
+    last_sent = float(session.get('forgot_otp_sent_at', 0) or 0)
+    if time.time() - last_sent < 60:
+        return jsonify({'success': False, 'message': 'Please wait 60 seconds before requesting another code.'}), 429
+
     db = get_db()
-    user = db.execute("SELECT id FROM users WHERE LOWER(email) = LOWER(?)", (email,)).fetchone()
-    if user:
-        session['forgot_verified_email'] = email
-        return jsonify({'success': True})
-    return jsonify({'success': False, 'message': 'This email address is not registered.'})
+    user = db.execute("SELECT id FROM users WHERE LOWER(email) = LOWER(?) AND status = 'active'", (email,)).fetchone()
+
+    # Use the same response for existing and unknown accounts to reduce email enumeration.
+    session['forgot_otp_sent_at'] = time.time()
+    if not user:
+        return jsonify({'success': True, 'message': 'If this account exists, a verification code has been sent.'})
+
+    otp = f"{secrets.randbelow(900000) + 100000:06d}"
+    try:
+        send_password_reset_otp(email, otp)
+    except Exception as exc:
+        app.logger.error("Password reset email delivery failed: %s", exc)
+        return jsonify({'success': False, 'message': 'Email service is unavailable. Please contact the administrator.'}), 503
+
+    otp_digest = hmac.new(app.secret_key.encode('utf-8'), otp.encode('utf-8'), hashlib.sha256).hexdigest()
+    session['forgot_verified_email'] = email
+    session['forgot_otp_hash'] = otp_digest
+    session['forgot_otp_expires'] = time.time() + 600
+    session['forgot_otp_attempts'] = 0
+    session['forgot_otp_verified'] = False
+    return jsonify({'success': True, 'message': 'If this account exists, a verification code has been sent.'})
+
+
+@app.route('/api/forgot-password/verify-otp', methods=['POST'])
+def forgot_password_verify_otp():
+    data = request.get_json(silent=True) or {}
+    otp = str(data.get('otp', '')).strip()
+    expected = session.get('forgot_otp_hash')
+    expires = float(session.get('forgot_otp_expires', 0) or 0)
+
+    if not session.get('forgot_verified_email') or not expected or time.time() > expires:
+        return jsonify({'success': False, 'message': 'Code expired. Please request a new one.'}), 400
+    if not re.fullmatch(r'\d{6}', otp):
+        return jsonify({'success': False, 'message': 'Enter the 6-digit code.'}), 400
+
+    attempts = int(session.get('forgot_otp_attempts', 0))
+    if attempts >= 5:
+        return jsonify({'success': False, 'message': 'Too many attempts. Request a new code.'}), 429
+
+    candidate = hmac.new(app.secret_key.encode('utf-8'), otp.encode('utf-8'), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(candidate, expected):
+        session['forgot_otp_attempts'] = attempts + 1
+        return jsonify({'success': False, 'message': 'Incorrect verification code.'}), 400
+
+    session['forgot_otp_verified'] = True
+    session['forgot_otp_verified_at'] = time.time()
+    session.pop('forgot_otp_hash', None)
+    return jsonify({'success': True})
+
 
 @app.route('/api/forgot-password/reset', methods=['POST'])
 def forgot_password_reset():
-    if not session.get('forgot_captcha_verified') or not session.get('forgot_verified_email'):
-        return jsonify({'success': False, 'message': 'Session expired or invalid flow. Please try again.'})
-    
-    data = request.get_json() or {}
-    password = data.get('password', '')
-    confirm_password = data.get('confirm_password', '')
-    
+    verified_at = float(session.get('forgot_otp_verified_at', 0) or 0)
+    if (
+        not session.get('forgot_otp_verified')
+        or not session.get('forgot_verified_email')
+        or time.time() - verified_at > 600
+    ):
+        return jsonify({'success': False, 'message': 'Verify the email code again before resetting your password.'}), 403
+
+    data = request.get_json(silent=True) or {}
+    password = str(data.get('password', ''))
+    confirm_password = str(data.get('confirm_password', ''))
+
     if not password or not confirm_password:
-        return jsonify({'success': False, 'message': 'Both password fields are required.'})
+        return jsonify({'success': False, 'message': 'Both password fields are required.'}), 400
     if password != confirm_password:
-        return jsonify({'success': False, 'message': 'Passwords do not match.'})
-    if len(password) < 6:
-        return jsonify({'success': False, 'message': 'Password must be at least 6 characters.'})
-    
+        return jsonify({'success': False, 'message': 'Passwords do not match.'}), 400
+    if len(password) < 8:
+        return jsonify({'success': False, 'message': 'Password must be at least 8 characters.'}), 400
+
     email = session.get('forgot_verified_email')
     db = get_db()
     try:
         hashed = safe_generate_password_hash(password)
-        db.execute("UPDATE users SET password_hash = ? WHERE LOWER(email) = LOWER(?)", (hashed, email))
+        cursor = db.execute("UPDATE users SET password_hash = ? WHERE LOWER(email) = LOWER(?)", (hashed, email))
+        if cursor.rowcount != 1:
+            db.rollback()
+            return jsonify({'success': False, 'message': 'Account not found. Please restart the reset process.'}), 404
         db.commit()
-        # Clear forgot password session keys
-        session.pop('forgot_captcha_ans', None)
-        session.pop('forgot_captcha_verified', None)
-        session.pop('forgot_verified_email', None)
+        for key in (
+            'forgot_captcha_ans', 'forgot_captcha_expires', 'forgot_captcha_attempts',
+            'forgot_captcha_verified', 'forgot_verified_email', 'forgot_otp_hash',
+            'forgot_otp_expires', 'forgot_otp_attempts', 'forgot_otp_verified',
+            'forgot_otp_verified_at', 'forgot_otp_sent_at'
+        ):
+            session.pop(key, None)
         return jsonify({'success': True})
-    except Exception as e:
-        return jsonify({'success': False, 'message': f'Error resetting password: {str(e)}'})
+    except Exception:
+        db.rollback()
+        app.logger.exception("Password reset failed")
+        return jsonify({'success': False, 'message': 'Unable to reset password right now. Please try again.'}), 500
+
 
 # 3. CREATE ACCOUNT / SIGN UP
 @app.route('/signup', methods=['GET', 'POST'])
@@ -1746,8 +1928,8 @@ def signup():
             flash('Username must be at least 3 characters.', 'danger')
             return render_template('signup.html', full_name=full_name, username=username, email=email)
             
-        if len(password) < 6:
-            flash('Password must be at least 6 characters.', 'danger')
+        if len(password) < 8:
+            flash('Password must be at least 8 characters.', 'danger')
             return render_template('signup.html', full_name=full_name, username=username, email=email)
             
         if password != confirm_password:
@@ -1806,7 +1988,7 @@ def signup():
         session['user_id'] = new_user_id
         session['username'] = username
         session['role'] = 'user'
-        session.permanent = True
+        session.permanent = False
         
         if starting_coins > 0:
             flash(f'Account created successfully! You received {starting_coins} welcome bonus coins.', 'success')
@@ -2109,7 +2291,7 @@ def account():
                 return redirect(url_for('account'))
                 
             if len(new_pw) < 6:
-                flash('New password must be at least 6 characters long.', 'danger')
+                flash('New password must be at least 8 characters long.', 'danger')
                 return redirect(url_for('account'))
                 
             if new_pw != confirm_pw:
@@ -2289,7 +2471,8 @@ def renew_server(server_id):
         
     user = get_current_user()
     db = get_db()
-    package_id = request.json.get('package_id') or request.form.get('package_id')
+    payload = get_request_data()
+    package_id = payload.get('package_id')
     
     pkg = db.execute("SELECT * FROM packages WHERE id = ? AND is_first_time_offer = 0", (package_id,)).fetchone()
     if not pkg:
@@ -2341,7 +2524,7 @@ def server_action(server_id):
     if not server:
         return jsonify({'success': False, 'message': 'Server not found'}), 404
         
-    action = request.json.get('action') if request.is_json else request.form.get('action')
+    action = get_request_data().get('action')
     
     if action == 'start':
         res = start_server_process(server_id)
@@ -2494,11 +2677,56 @@ def clear_server_logs(server_id):
 
 # 11. FILE MANAGER
 def is_safe_path(base_dir, path, follow_symlinks=True):
-    if follow_symlinks:
-        matchpath = os.path.realpath(path)
-    else:
-        matchpath = os.path.abspath(path)
-    return base_dir == os.path.commonpath((base_dir, matchpath))
+    try:
+        base_path = os.path.realpath(base_dir)
+        candidate = os.path.realpath(path) if follow_symlinks else os.path.abspath(path)
+        return os.path.commonpath((base_path, candidate)) == base_path
+    except (OSError, ValueError, TypeError):
+        return False
+
+def safe_extract_zip(zip_file, destination_dir, base_dir):
+    """Extract a ZIP with path, symlink, member-count and expansion limits."""
+    members = zip_file.infolist()
+    if len(members) > 2000:
+        raise ValueError('ZIP contains too many files (limit: 2000).')
+
+    total_size = 0
+    for info in members:
+        name = info.filename.replace(chr(92), '/')
+        if name.startswith('/') or re.match(r'^[A-Za-z]:', name):
+            raise ValueError(f'Absolute path in ZIP is not allowed: {info.filename}')
+        parts = [part for part in name.split('/') if part not in ('', '.')]
+        if not parts or any(part == '..' for part in parts):
+            raise ValueError(f'Unsafe path in ZIP: {info.filename}')
+        unix_mode = (info.external_attr >> 16) & 0o170000
+        if unix_mode == stat.S_IFLNK:
+            raise ValueError(f'Symbolic links are not allowed in ZIP: {info.filename}')
+        if info.file_size > 25 * 1024 * 1024:
+            raise ValueError(f'ZIP member is too large: {info.filename}')
+        total_size += info.file_size
+        if total_size > 100 * 1024 * 1024:
+            raise ValueError('ZIP expands beyond the 100 MB safety limit.')
+
+        target = os.path.abspath(os.path.join(destination_dir, *parts))
+        if not is_safe_path(base_dir, target):
+            raise ValueError(f'Unsafe path in ZIP: {info.filename}')
+
+    extracted = 0
+    for info in members:
+        name = info.filename.replace(chr(92), '/')
+        parts = [part for part in name.split('/') if part not in ('', '.')]
+        if not parts:
+            continue
+        target = os.path.abspath(os.path.join(destination_dir, *parts))
+        if info.is_dir():
+            os.makedirs(target, exist_ok=True)
+            continue
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with zip_file.open(info, 'r') as source, open(target, 'wb') as output:
+            shutil.copyfileobj(source, output, length=1024 * 1024)
+        extracted += 1
+    return extracted
+
 
 @app.route('/servers/<int:server_id>/files')
 @login_required
@@ -2631,6 +2859,8 @@ def upload_file(server_id):
     
     if not is_safe_path(server_dir, target_dir):
         return jsonify({'success': False, 'message': 'Access denied'}), 403
+    if not os.path.isdir(target_dir):
+        return jsonify({'success': False, 'message': 'Target folder does not exist.'}), 404
         
     if 'files' not in request.files:
         return jsonify({'success': False, 'message': 'No files selected'}), 400
@@ -2643,6 +2873,8 @@ def upload_file(server_id):
     for f in uploaded_files:
         if f and f.filename:
             filename = secure_filename(f.filename)
+            if not filename:
+                continue
             save_path = os.path.join(target_dir, filename)
             f.save(save_path)
             
@@ -2650,19 +2882,15 @@ def upload_file(server_id):
             if filename.lower().endswith('.zip') or zipfile.is_zipfile(save_path):
                 try:
                     with zipfile.ZipFile(save_path, 'r') as zf:
-                        for member in zf.namelist():
-                            member_path = os.path.abspath(os.path.join(target_dir, member))
-                            if not is_safe_path(server_dir, member_path):
-                                os.remove(save_path)
-                                return jsonify({'success': False, 'message': f'Unsafe path in ZIP file: {member}'}), 400
-                        zf.extractall(target_dir)
+                        safe_extract_zip(zf, target_dir, server_dir)
                     extracted_zip_count += 1
                     os.remove(save_path)  # Delete zip so extracted files are shown directly
                     uploaded_names.append(f"{filename} (Extracted)")
                 except Exception as ze:
-                    # Fallback if zip extraction fails
+                    # Keep the original archive available and report it as a normal file.
+                    write_server_log(server_id, 'WARNING', f"ZIP was stored but not extracted: {ze}")
                     count += 1
-                    uploaded_names.append(filename)
+                    uploaded_names.append(f"{filename} (not extracted)")
             else:
                 count += 1
                 uploaded_names.append(filename)
@@ -2719,8 +2947,9 @@ def save_file_content(server_id):
     if not server:
         return jsonify({'success': False, 'message': 'Server not found'}), 404
         
-    file_path = request.json.get('path', '').strip('/') if request.is_json else request.form.get('path', '').strip('/')
-    content = request.json.get('content', '') if request.is_json else request.form.get('content', '')
+    payload = get_request_data()
+    file_path = str(payload.get('path', '')).strip('/')
+    content = payload.get('content', '')
     
     server_dir = get_server_dir(server['user_id'], server_id)
     target = os.path.join(server_dir, file_path)
@@ -2742,7 +2971,7 @@ def delete_file(server_id):
     if not server:
         return jsonify({'success': False, 'message': 'Server not found'}), 404
         
-    target_path = request.json.get('path', '').strip('/') if request.is_json else request.form.get('path', '').strip('/')
+    target_path = str(get_request_data().get('path', '')).strip('/')
     server_dir = get_server_dir(server['user_id'], server_id)
     target = os.path.join(server_dir, target_path)
     
@@ -2765,11 +2994,12 @@ def rename_file(server_id):
     if not server:
         return jsonify({'success': False, 'message': 'Server not found'}), 404
         
-    old_path = request.json.get('old_path', '').strip('/') if request.is_json else request.form.get('old_path', '').strip('/')
-    new_name = secure_filename(request.json.get('new_name', '').strip() if request.is_json else request.form.get('new_name', '').strip())
+    payload = get_request_data()
+    old_path = str(payload.get('old_path', '')).strip('/')
+    new_name = secure_filename(str(payload.get('new_name', '')).strip())
     
-    if not new_name:
-        return jsonify({'success': False, 'message': 'Invalid new name'}), 400
+    if not old_path or not new_name:
+        return jsonify({'success': False, 'message': 'A valid source path and new name are required'}), 400
         
     server_dir = get_server_dir(server['user_id'], server_id)
     source = os.path.join(server_dir, old_path)
@@ -2808,7 +3038,7 @@ def unzip_file(server_id):
     if not server:
         return jsonify({'success': False, 'message': 'Server not found'}), 404
         
-    zip_path = request.json.get('path', '').strip('/') if request.is_json else request.form.get('path', '').strip('/')
+    zip_path = str(get_request_data().get('path', '')).strip('/')
     server_dir = get_server_dir(server['user_id'], server_id)
     target_zip = os.path.join(server_dir, zip_path)
     extract_dir = os.path.dirname(target_zip)
@@ -2818,12 +3048,7 @@ def unzip_file(server_id):
         
     try:
         with zipfile.ZipFile(target_zip, 'r') as zf:
-            for member in zf.namelist():
-                # Safe Zip-Slip prevention
-                member_path = os.path.abspath(os.path.join(extract_dir, member))
-                if not is_safe_path(server_dir, member_path):
-                    return jsonify({'success': False, 'message': f'Unsafe path in zip file: {member}'}), 400
-            zf.extractall(extract_dir)
+            safe_extract_zip(zf, extract_dir, server_dir)
             
         write_server_log(server_id, 'INFO', f"Extracted ZIP archive '{os.path.basename(target_zip)}' safely.")
         
@@ -2911,9 +3136,9 @@ def install_package(server_id):
     if not server:
         return jsonify({'success': False, 'message': 'Server not found'}), 404
         
-    package_name = request.json.get('package_name', '').strip() if request.is_json else request.form.get('package_name', '').strip()
-    version = request.json.get('version', '').strip() if request.is_json else request.form.get('version', '').strip()
-    is_requirements = request.json.get('is_requirements', False) if request.is_json else False
+    package_name = str(get_request_data().get('package_name', '')).strip()
+    version = str(get_request_data().get('version', '')).strip()
+    is_requirements = bool(get_request_data().get('is_requirements', False))
     
     server_dir = get_server_dir(server['user_id'], server_id)
     packages_dir = os.path.join(server_dir, 'packages')
@@ -2944,7 +3169,7 @@ def install_package(server_id):
         cmd.append(install_spec)
         
     try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180, env=get_server_runtime_env(server_dir, packages_dir))
         output = res.stdout
         
         # Sanitize logs of any secrets
@@ -3009,7 +3234,7 @@ def install_all_packages(server_id):
         req_path = os.path.join(server_dir, 'requirements.txt')
         cmd = [sys.executable, '-m', 'pip', 'install', '--target', packages_dir, '-r', req_path]
         try:
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=240)
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=240, env=get_server_runtime_env(server_dir, packages_dir))
             aggregated_logs.append(f"=== requirements.txt ===\n{res.stdout}")
             if res.returncode == 0:
                 installed_list.append('requirements.txt')
@@ -3029,7 +3254,7 @@ def install_all_packages(server_id):
             
         cmd = [sys.executable, '-m', 'pip', 'install', '--target', packages_dir, spec]
         try:
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120, env=get_server_runtime_env(server_dir, packages_dir))
             aggregated_logs.append(f"=== {spec} ===\n{res.stdout}")
             if res.returncode == 0:
                 installed_list.append(spec)
@@ -3063,7 +3288,7 @@ def delete_server_package(server_id):
     if not server:
         return jsonify({'success': False, 'message': 'Server not found'}), 404
         
-    pkg_name = request.json.get('package_name', '').strip() if request.is_json else request.form.get('package_name', '').strip()
+    pkg_name = str(get_request_data().get('package_name', '')).strip()
     if not pkg_name:
         return jsonify({'success': False, 'message': 'Package name required'}), 400
         
@@ -3312,8 +3537,8 @@ def admin_update_user(user_id):
 
     # Password update if provided
     if new_password:
-        if len(new_password) < 6:
-            flash('New password must be at least 6 characters.', 'danger')
+        if len(new_password) < 8:
+            flash('New password must be at least 8 characters.', 'danger')
             return redirect(url_for('admin_users'))
         pw_hash = safe_generate_password_hash(new_password)
         db.execute(
@@ -4291,7 +4516,7 @@ def internal_server_error(e):
     return render_template('errors/500.html'), 500
 
 if __name__ == '__main__':
-    PORT = 3000
+    PORT = int(os.environ.get('PORT', '3000'))
     print("==================================================")
     print("  HOSTX VIP WHITE — PYTHON HOSTING PLATFORM       ")
     print(f"  Starting server on http://0.0.0.0:{PORT}       ")
