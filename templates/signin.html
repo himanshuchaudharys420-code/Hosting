@@ -3,6 +3,11 @@
 {% block title %}Sign In — {{ vip_site_name }}{% endblock %}
 
 {% block content %}
+
+<style>
+  .reset-step-badge { font-size: .68rem; font-weight: 700; display: flex; align-items: center; gap: 4px; color: #94A3B8; white-space: nowrap; }
+  .reset-step-badge .step-num { display: inline-flex; width: 18px; height: 18px; border-radius: 50%; background: #CBD5E1; color: #64748B; align-items: center; justify-content: center; font-size: .65rem; font-weight: 800; flex: 0 0 auto; }
+</style>
 <div class="container-mobile" style="max-width: 440px; margin-top: 24px;">
 
   <div class="vip-card" style="padding: 32px 24px;">
@@ -93,18 +98,11 @@
     </div>
 
     <!-- Progress Steps Indicator -->
-    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 28px; background: #F8FAFC; padding: 8px 12px; border-radius: 8px; border: 1px solid #E2E8F0;">
-      <div id="badge-step-1" style="font-size: 0.75rem; font-weight: 700; display: flex; align-items: center; gap: 4px; color: #4F46E5;">
-        <span class="step-num" style="display: inline-flex; width: 18px; height: 18px; border-radius: 50%; background: #4F46E5; color: #fff; align-items: center; justify-content: center; font-size: 0.65rem; font-weight: 800;">1</span> Challenge
-      </div>
-      <div style="flex: 1; height: 1px; background: #E2E8F0; margin: 0 8px;"></div>
-      <div id="badge-step-2" style="font-size: 0.75rem; font-weight: 700; display: flex; align-items: center; gap: 4px; color: #94A3B8;">
-        <span class="step-num" style="display: inline-flex; width: 18px; height: 18px; border-radius: 50%; background: #CBD5E1; color: #64748B; align-items: center; justify-content: center; font-size: 0.65rem; font-weight: 800;">2</span> Email
-      </div>
-      <div style="flex: 1; height: 1px; background: #E2E8F0; margin: 0 8px;"></div>
-      <div id="badge-step-3" style="font-size: 0.75rem; font-weight: 700; display: flex; align-items: center; gap: 4px; color: #94A3B8;">
-        <span class="step-num" style="display: inline-flex; width: 18px; height: 18px; border-radius: 50%; background: #CBD5E1; color: #64748B; align-items: center; justify-content: center; font-size: 0.65rem; font-weight: 800;">3</span> Password
-      </div>
+    <div style="display: flex; justify-content: space-between; align-items: center; gap: 5px; margin-bottom: 28px; background: #F8FAFC; padding: 8px 10px; border-radius: 8px; border: 1px solid #E2E8F0;">
+      <div id="badge-step-1" class="reset-step-badge"><span class="step-num">1</span> Challenge</div>
+      <div id="badge-step-2" class="reset-step-badge"><span class="step-num">2</span> Email</div>
+      <div id="badge-step-3" class="reset-step-badge"><span class="step-num">3</span> Code</div>
+      <div id="badge-step-4" class="reset-step-badge"><span class="step-num">4</span> Password</div>
     </div>
 
     <!-- STEP 1 CONTAINER: CAPTCHA -->
@@ -149,41 +147,38 @@
       </div>
       
       <button type="button" onclick="submitEmail()" class="btn-primary btn-block" style="padding: 12px; font-size: 0.95rem; font-weight: 700; border-radius: 8px; margin-top: 16px; background: #4F46E5; border-color: #4F46E5; width: 100%;">
-        Verify Email Address &rarr;
+        Send Verification Code &rarr;
       </button>
     </div>
 
-    <!-- STEP 3 CONTAINER: NEW PASSWORD -->
+    <!-- STEP 3 CONTAINER: EMAIL OTP -->
     <div id="step-3-container" style="display: none;">
       <div class="form-group">
-        <label class="form-label" style="font-weight: 700; color: #334155; margin-bottom: 8px; display: block;">Step 3: New Password</label>
-        <p style="font-size: 0.85rem; color: #64748B; margin-bottom: 16px;">Set your new secure login password. This will instantly replace your old password.</p>
-        
+        <label class="form-label" for="reset-otp" style="font-weight: 700; color: #334155; margin-bottom: 8px; display: block;">Step 3: Email Verification Code</label>
+        <p style="font-size: 0.85rem; color: #64748B; margin-bottom: 16px;">Enter the 6-digit code sent to your registered email address. The code expires in 10 minutes.</p>
+        <input type="text" inputmode="numeric" maxlength="6" id="reset-otp" class="form-control" placeholder="6-digit code" autocomplete="one-time-code" style="padding: 12px; border-color: #CBD5E1; border-radius: 8px; width: 100%; text-align: center; letter-spacing: 5px; font-size: 1.2rem;">
+        <div id="otp-error" style="color: #EF4444; font-size: 0.85rem; display: none; margin-top: 8px; font-weight: 600;"></div>
+      </div>
+      <button type="button" onclick="submitOtp()" class="btn-primary btn-block" style="padding: 12px; font-size: 0.95rem; font-weight: 700; border-radius: 8px; margin-top: 16px; background: #4F46E5; border-color: #4F46E5; width: 100%;">
+        Verify Code &rarr;
+      </button>
+    </div>
+
+    <!-- STEP 4 CONTAINER: NEW PASSWORD -->
+    <div id="step-4-container" style="display: none;">
+      <div class="form-group">
+        <label class="form-label" style="font-weight: 700; color: #334155; margin-bottom: 8px; display: block;">Step 4: New Password</label>
+        <p style="font-size: 0.85rem; color: #64748B; margin-bottom: 16px;">Set a new password with at least 8 characters.</p>
         <div style="margin-bottom: 14px;">
           <label style="font-size: 0.8rem; font-weight: 700; color: #64748B; display: block; margin-bottom: 4px;">New Password</label>
-          <input 
-            type="password" 
-            id="reset-password" 
-            class="form-control" 
-            placeholder="Min 6 characters" 
-            style="padding: 12px; border-color: #CBD5E1; border-radius: 8px; width: 100%;"
-          >
+          <input type="password" id="reset-password" class="form-control" placeholder="Min 8 characters" autocomplete="new-password" style="padding: 12px; border-color: #CBD5E1; border-radius: 8px; width: 100%;">
         </div>
-        
         <div>
           <label style="font-size: 0.8rem; font-weight: 700; color: #64748B; display: block; margin-bottom: 4px;">Confirm Password</label>
-          <input 
-            type="password" 
-            id="reset-confirm" 
-            class="form-control" 
-            placeholder="Repeat new password" 
-            style="padding: 12px; border-color: #CBD5E1; border-radius: 8px; width: 100%;"
-          >
+          <input type="password" id="reset-confirm" class="form-control" placeholder="Repeat new password" autocomplete="new-password" style="padding: 12px; border-color: #CBD5E1; border-radius: 8px; width: 100%;">
         </div>
-        
         <div id="reset-error" style="color: #EF4444; font-size: 0.85rem; display: none; margin-top: 8px; font-weight: 600;"></div>
       </div>
-      
       <button type="button" onclick="submitPasswordReset()" class="btn-primary btn-block" style="padding: 12px; font-size: 0.95rem; font-weight: 700; border-radius: 8px; margin-top: 16px; background: #10B981; border-color: #10B981; width: 100%;">
         Change Password &nbsp;✓
       </button>
@@ -245,22 +240,19 @@ document.addEventListener("DOMContentLoaded", function() {
   // Check on load if forgot password timer is active
   checkForgotTimer();
 
-  // Load saved credentials on page load
+  // Remember only the email address. Never store account passwords in localStorage.
+  localStorage.removeItem("hostx_password");
   if (localStorage.getItem("hostx_remember") === "true") {
     emailInput.value = localStorage.getItem("hostx_email") || "";
-    passwordInput.value = localStorage.getItem("hostx_password") || "";
     rememberCheckbox.checked = true;
   }
 
-  // Handle form submission
-  loginForm.addEventListener("submit", function(e) {
+  loginForm.addEventListener("submit", function() {
     if (rememberCheckbox.checked) {
       localStorage.setItem("hostx_email", emailInput.value);
-      localStorage.setItem("hostx_password", passwordInput.value);
       localStorage.setItem("hostx_remember", "true");
     } else {
       localStorage.removeItem("hostx_email");
-      localStorage.removeItem("hostx_password");
       localStorage.setItem("hostx_remember", "false");
     }
   });
@@ -282,47 +274,17 @@ function closeForgotPasswordModal() {
 }
 
 function showStep(step) {
-  document.getElementById("step-1-container").style.display = step === 1 ? "block" : "none";
-  document.getElementById("step-2-container").style.display = step === 2 ? "block" : "none";
-  document.getElementById("step-3-container").style.display = step === 3 ? "block" : "none";
-  
-  // Step 1 Badge
-  const b1 = document.getElementById("badge-step-1");
-  const num1 = b1.querySelector(".step-num");
-  if (step >= 1) {
-    b1.style.color = "#4F46E5";
-    num1.style.background = "#4F46E5";
-    num1.style.color = "#FFFFFF";
-  } else {
-    b1.style.color = "#94A3B8";
-    num1.style.background = "#CBD5E1";
-    num1.style.color = "#64748B";
-  }
-
-  // Step 2 Badge
-  const b2 = document.getElementById("badge-step-2");
-  const num2 = b2.querySelector(".step-num");
-  if (step >= 2) {
-    b2.style.color = "#4F46E5";
-    num2.style.background = "#4F46E5";
-    num2.style.color = "#FFFFFF";
-  } else {
-    b2.style.color = "#94A3B8";
-    num2.style.background = "#CBD5E1";
-    num2.style.color = "#64748B";
-  }
-
-  // Step 3 Badge
-  const b3 = document.getElementById("badge-step-3");
-  const num3 = b3.querySelector(".step-num");
-  if (step >= 3) {
-    b3.style.color = "#10B981";
-    num3.style.background = "#10B981";
-    num3.style.color = "#FFFFFF";
-  } else {
-    b3.style.color = "#94A3B8";
-    num3.style.background = "#CBD5E1";
-    num3.style.color = "#64748B";
+  for (let index = 1; index <= 4; index++) {
+    const container = document.getElementById(`step-${index}-container`);
+    const badge = document.getElementById(`badge-step-${index}`);
+    if (container) container.style.display = index === step ? "block" : "none";
+    if (badge) {
+      const active = index <= step;
+      badge.style.color = active ? "#4F46E5" : "#94A3B8";
+      const number = badge.querySelector(".step-num");
+      number.style.background = active ? "#4F46E5" : "#CBD5E1";
+      number.style.color = active ? "#FFFFFF" : "#64748B";
+    }
   }
 }
 
@@ -383,29 +345,55 @@ function submitEmail() {
   const email = document.getElementById("reset-email").value.trim();
   const errorDiv = document.getElementById("email-error");
   errorDiv.style.display = "none";
-  
+
   if (!email) {
     errorDiv.textContent = "Please enter your registered email address.";
     errorDiv.style.display = "block";
     return;
   }
-  
+
   fetch('/api/forgot-password/verify-email', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email: email })
   })
-  .then(r => r.json())
-  .then(data => {
-    if (data.success) {
+  .then(async r => ({ response: r, data: await r.json() }))
+  .then(({ response, data }) => {
+    if (response.ok && data.success) {
       currentStep = 3;
       showStep(3);
     } else {
-      errorDiv.textContent = data.message || "This email is not registered.";
+      errorDiv.textContent = data.message || "Unable to send a verification code.";
       errorDiv.style.display = "block";
     }
   })
-  .catch(err => {
+  .catch(() => {
+    errorDiv.textContent = "Connection error. Please try again.";
+    errorDiv.style.display = "block";
+  });
+}
+
+function submitOtp() {
+  const otp = document.getElementById("reset-otp").value.trim();
+  const errorDiv = document.getElementById("otp-error");
+  errorDiv.style.display = "none";
+
+  fetch('/api/forgot-password/verify-otp', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ otp: otp })
+  })
+  .then(async r => ({ response: r, data: await r.json() }))
+  .then(({ response, data }) => {
+    if (response.ok && data.success) {
+      currentStep = 4;
+      showStep(4);
+    } else {
+      errorDiv.textContent = data.message || "Verification failed.";
+      errorDiv.style.display = "block";
+    }
+  })
+  .catch(() => {
     errorDiv.textContent = "Connection error. Please try again.";
     errorDiv.style.display = "block";
   });
@@ -430,8 +418,8 @@ function submitPasswordReset() {
     return;
   }
   
-  if (password.length < 6) {
-    errorDiv.textContent = "Password must be at least 6 characters.";
+  if (password.length < 8) {
+    errorDiv.textContent = "Password must be at least 8 characters.";
     errorDiv.style.display = "block";
     return;
   }
