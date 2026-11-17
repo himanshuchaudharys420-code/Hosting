@@ -4,12 +4,5 @@ dist/
 coverage/
 .DS_Store
 *.log
-__pycache__/
-*.py[cod]
 .env*
 !.env.example
-database/*.db
-servers/
-uploads/
-static/uploads/
-data/
